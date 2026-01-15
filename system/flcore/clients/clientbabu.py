@@ -1,5 +1,6 @@
 import numpy as np
 import time
+import torch
 from flcore.clients.clientbase import Client
 
 
@@ -9,8 +10,14 @@ class clientBABU(Client):
 
         self.fine_tuning_epochs = args.fine_tuning_epochs
 
-        for param in self.model.head.parameters():
-            param.requires_grad = False
+        # Only freeze head if not freezing backbone
+        if not getattr(args, 'freeze_backbone', False):
+            for param in self.model.head.parameters():
+                param.requires_grad = False
+
+        # Update optimizer to only include trainable parameters
+        trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
+        self.optimizer = torch.optim.SGD(trainable_params, lr=self.learning_rate)
 
 
     def train(self):

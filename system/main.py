@@ -146,6 +146,13 @@ def run(args):
             # feature_dim = list(args.model.fc.parameters())[0].shape[1]
             # args.model.fc = nn.Linear(feature_dim, args.num_classes).to(args.device)
         
+        elif model_str == "EfficientNet":
+            args.model = torchvision.models.efficientnet_b0(pretrained=False, num_classes=args.num_classes).to(args.device)
+            
+            # args.model = torchvision.models.efficientnet_b0(pretrained=True).to(args.device)
+            # feature_dim = list(args.model.classifier[1].parameters())[0].shape[1]
+            # args.model.classifier[1] = nn.Linear(feature_dim, args.num_classes).to(args.device)
+        
         elif model_str == "TinyViT":
             # Load the Tiny-ViT model hosted on Hugging Face via timm
             try:
@@ -237,6 +244,16 @@ def run(args):
             raise NotImplementedError
 
         print(args.model)
+
+        # Normalize model head attribute to .fc for consistency with FedAvg/FedBABU
+        # (Some models use .classifier or .head instead of .fc)
+        if not hasattr(args.model, 'fc'):
+            if hasattr(args.model, 'classifier'):
+                # EfficientNet, DenseNet, etc. use .classifier
+                args.model.fc = args.model.classifier
+            elif hasattr(args.model, 'head'):
+                # Vision Transformers and some other models use .head
+                args.model.fc = args.model.head
 
         # Optionally freeze backbone weights and train only the classification head
         if getattr(args, 'freeze_backbone', False):

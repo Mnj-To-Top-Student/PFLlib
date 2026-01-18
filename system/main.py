@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 import torchvision
 import logging
+import torch.nn as nn
 
 from flcore.servers.serveravg import FedAvg
 from flcore.servers.serverpFedMe import pFedMe
@@ -66,6 +67,57 @@ logger.setLevel(logging.ERROR)
 
 warnings.simplefilter("ignore")
 torch.manual_seed(0)
+
+class BackboneOnly(nn.Module):
+    """
+    Correct backbone extractor.
+    Always returns a 2D tensor (B, D).
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+
+        # ---------- ResNet (torchvision) ----------
+        if isinstance(self.model, torchvision.models.ResNet):
+            x = self.model.conv1(x)
+            x = self.model.bn1(x)
+            x = self.model.relu(x)
+            x = self.model.maxpool(x)
+
+            x = self.model.layer1(x)
+            x = self.model.layer2(x)
+            x = self.model.layer3(x)
+            x = self.model.layer4(x)
+
+            x = self.model.avgpool(x)
+            x = torch.flatten(x, 1)
+            return x
+
+        # ---------- EfficientNet ----------
+        if hasattr(self.model, "features") and hasattr(self.model, "avgpool"):
+            x = self.model.features(x)
+            x = self.model.avgpool(x)
+            x = torch.flatten(x, 1)
+            return x
+
+        # ---------- ViT / TinyViT ----------
+        if hasattr(self.model, "forward_features"):
+            x = self.model.forward_features(x)
+
+            # TinyViT returns feature maps: (B, C, H, W)
+            if x.dim() == 4:
+                x = torch.mean(x, dim=(2, 3))  # Global Average Pool
+
+            return x
+
+        # ---------- Fallback ----------
+        x = self.model(x)
+        if x.dim() > 2:
+            x = torch.flatten(x, 1)
+        return x
 
 
 def run(args):
@@ -146,7 +198,7 @@ def run(args):
             # feature_dim = list(args.model.fc.parameters())[0].shape[1]
             # args.model.fc = nn.Linear(feature_dim, args.num_classes).to(args.device)
         
-        elif model_str == "EfficientNet":
+        elif model_str == "EfficientNetB0":
             args.model = torchvision.models.efficientnet_b0(pretrained=False, num_classes=args.num_classes).to(args.device)
             
             # args.model = torchvision.models.efficientnet_b0(pretrained=True).to(args.device)
@@ -154,61 +206,24 @@ def run(args):
             # args.model.classifier[1] = nn.Linear(feature_dim, args.num_classes).to(args.device)
         
         elif model_str == "TinyViT":
-            # Load the Tiny-ViT model hosted on Hugging Face via timm
             try:
                 import timm
             except Exception:
-                raise ImportError("Please install timm and huggingface-hub: pip install timm huggingface-hub")
+                raise ImportError("Please install timm: pip install timm")
 
-            # model name on HF: 'timm/tiny_vit_5m_224.dist_in22k'
-            # timm accepts the model name (without 'timm/') for create_model
             model_name = 'tiny_vit_5m_224.dist_in22k'
-            # Create model without forcing classifier; we'll reset appropriately
             args.model = timm.create_model(model_name, pretrained=True)
 
-            # Try to reset classifier properly (timm models provide reset_classifier)
-            try:
-                if hasattr(args.model, 'reset_classifier'):
-                    args.model.reset_classifier(args.num_classes)
-                else:
-                    raise AttributeError
-            except Exception:
-                # Fallback: try to infer feature dim and set a Linear head
-                nf = getattr(args.model, 'num_features', None)
-                if nf is None:
-                    # try to inspect existing head
-                    for attr in ('head', 'fc', 'classifier'):
-                        if hasattr(args.model, attr):
-                            mod = getattr(args.model, attr)
-                            # try to get in_features from a linear layer
-                            if hasattr(mod, 'in_features'):
-                                nf = mod.in_features
-                                break
-                            # try common submodules
-                            if hasattr(mod, 'weight') and getattr(mod, 'weight').ndim == 2:
-                                nf = mod.weight.shape[1]
-                                break
+            # ---- CORRECT WAY (timm standard) ----
+            # TinyViT feature dimension
+            in_dim = args.model.num_features  # = 320
 
-                if nf is None:
-                    raise RuntimeError('Unable to determine feature dimension for TinyViT classifier. Update the code to match model API.')
-
-                # attach a simple linear head compatible with BaseHeadSplit
-                args.model.fc = nn.Linear(nf, args.num_classes)
-
-            # If the timm model exposes a conv-style `head` (common), detach it so base returns feature maps
-            if hasattr(args.model, 'head'):
-                # preserve original conv-style head as fc for downstream code
-                orig_head = args.model.head
-                args.model.head = nn.Identity()
-                args.model.fc = orig_head
-            else:
-                # ensure `.fc` attribute exists for downstream code (copying head)
-                if not hasattr(args.model, 'fc'):
-                    if hasattr(args.model, 'classifier'):
-                        args.model.fc = args.model.classifier
+            # Replace head with simple Linear (FedBABU-compatible)
+            args.model.fc = nn.Linear(in_dim, args.num_classes)
 
             args.model = args.model.to(args.device)
-            
+
+
         elif model_str == "LSTM":
             args.model = LSTMNet(hidden_dim=args.feature_dim, vocab_size=args.vocab_size, num_classes=args.num_classes).to(args.device)
 
@@ -245,15 +260,18 @@ def run(args):
 
         print(args.model)
 
-        # Normalize model head attribute to .fc for consistency with FedAvg/FedBABU
-        # (Some models use .classifier or .head instead of .fc)
-        if not hasattr(args.model, 'fc'):
-            if hasattr(args.model, 'classifier'):
-                # EfficientNet, DenseNet, etc. use .classifier
+        # --------------------------------------------------
+        # Normalize classifier head to `.fc` for ALL models
+        # --------------------------------------------------
+        if not hasattr(args.model, "fc"):
+            if hasattr(args.model, "classifier"):
                 args.model.fc = args.model.classifier
-            elif hasattr(args.model, 'head'):
-                # Vision Transformers and some other models use .head
+            elif hasattr(args.model, "head"):
                 args.model.fc = args.model.head
+            else:
+                raise RuntimeError(
+                    f"Model {type(args.model)} has no fc / classifier / head attribute"
+                )
 
         # Optionally freeze backbone weights and train only the classification head
         if getattr(args, 'freeze_backbone', False):
@@ -279,8 +297,8 @@ def run(args):
         # select algorithm
         if args.algorithm == "FedAvg":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedAvg(args, i)
 
         elif args.algorithm == "Local":
@@ -309,8 +327,8 @@ def run(args):
 
         elif args.algorithm == "FedPer":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedPer(args, i)
 
         elif args.algorithm == "Ditto":
@@ -318,14 +336,14 @@ def run(args):
 
         elif args.algorithm == "FedRep":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedRep(args, i)
 
         elif args.algorithm == "FedPHP":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedPHP(args, i)
 
         elif args.algorithm == "FedBN":
@@ -333,14 +351,14 @@ def run(args):
 
         elif args.algorithm == "FedROD":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedROD(args, i)
 
         elif args.algorithm == "FedProto":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedProto(args, i)
 
         elif args.algorithm == "FedDyn":
@@ -348,14 +366,14 @@ def run(args):
 
         elif args.algorithm == "MOON":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = MOON(args, i)
 
         elif args.algorithm == "FedBABU":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedBABU(args, i)
 
         elif args.algorithm == "APPLE":
@@ -363,8 +381,8 @@ def run(args):
 
         elif args.algorithm == "FedGen":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedGen(args, i)
 
         elif args.algorithm == "SCAFFOLD":
@@ -378,20 +396,20 @@ def run(args):
 
         elif args.algorithm == "FedPAC":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedPAC(args, i)
 
         elif args.algorithm == "LG-FedAvg":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = LG_FedAvg(args, i)
 
         elif args.algorithm == "FedGC":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedGC(args, i)
 
         elif args.algorithm == "FML":
@@ -399,24 +417,26 @@ def run(args):
 
         elif args.algorithm == "FedKD":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedKD(args, i)
 
         elif args.algorithm == "FedPCL":
-            args.model.fc = nn.Identity()
+            args.head = copy.deepcopy(args.model.fc)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedPCL(args, i)
 
         elif args.algorithm == "FedCP":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedCP(args, i)
 
         elif args.algorithm == "GPFL":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = GPFL(args, i)
 
         elif args.algorithm == "FedNTD":
@@ -424,14 +444,14 @@ def run(args):
 
         elif args.algorithm == "FedGH":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedGH(args, i)
 
         elif args.algorithm == "FedDBE":
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedDBE(args, i)
 
         elif args.algorithm == 'FedCAC':
@@ -439,21 +459,20 @@ def run(args):
 
         elif args.algorithm == 'PFL-DA':
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = PFL_DA(args, i)
 
         elif args.algorithm == 'FedLC':
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedLC(args, i)
 
         elif args.algorithm == 'FedAS':
-
             args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            backbone = BackboneOnly(args.model)
+            args.model = BaseHeadSplit(backbone, args.head)
             server = FedAS(args, i)
             
         elif args.algorithm == "FedCross":

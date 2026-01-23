@@ -545,6 +545,17 @@ if __name__ == "__main__":
                         help="Set this for text tasks. 80 for Shakespeare. 32000 for AG_News and SogouNews.")
     parser.add_argument('-ml', "--max_len", type=int, default=200)
     parser.add_argument('-fs', "--few_shot", type=int, default=0)
+    # imbalance handling
+    parser.add_argument('-cwl', "--class_weighted_loss", type=bool, default=False,
+                        help="Use class-weighted CrossEntropyLoss per client")
+    parser.add_argument('-fl', "--focal_loss", type=bool, default=False,
+                        help="Use FocalLoss instead of CrossEntropyLoss")
+    parser.add_argument('-fg', "--focal_gamma", type=float, default=2.0,
+                        help="Gamma for FocalLoss")
+    parser.add_argument('-lsm', "--label_smoothing", type=float, default=0.0,
+                        help="Label smoothing for CrossEntropyLoss (0-0.2 typical)")
+    parser.add_argument('-os', "--oversample", type=bool, default=False,
+                        help="Use WeightedRandomSampler to balance classes per client")
     # practical
     parser.add_argument('-cdr', "--client_drop_rate", type=float, default=0.0,
                         help="Rate for clients that train but drop out")
@@ -628,10 +639,20 @@ if __name__ == "__main__":
             with open(config_path, 'r') as f:
                 config = json.load(f)
                 args.num_classes = config.get('num_classes', 10)
-                print(f"Auto-detected num_classes={args.num_classes} from {args.dataset} config.")
+                args.num_clients = config.get('num_clients', args.num_clients)
+                print(f"Auto-detected num_classes={args.num_classes}, num_clients={args.num_clients} from {args.dataset} config.")
         else:
             args.num_classes = 10
             print(f"Config not found; using default num_classes=10.")
+    else:
+        # Auto-detect num_clients from config even if num_classes is specified
+        import json
+        config_path = os.path.join('../dataset', args.dataset, 'config.json')
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                args.num_clients = config.get('num_clients', args.num_clients)
+                print(f"Auto-detected num_clients={args.num_clients} from {args.dataset} config.")
 
     if args.device == "cuda" and not torch.cuda.is_available():
         print("\ncuda is not avaiable.\n")

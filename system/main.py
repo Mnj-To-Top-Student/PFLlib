@@ -110,12 +110,11 @@ def run(args):
                 args.model = DNN(60, 20, num_classes=args.num_classes).to(args.device)
         
         elif model_str == "ResNet18":
-            args.model = torchvision.models.resnet18(pretrained=False, num_classes=args.num_classes).to(args.device)
+            args.model = torchvision.models.resnet18(pretrained=True).to(args.device)
+            feature_dim = list(args.model.fc.parameters())[0].shape[1]
+            args.model.fc = nn.Linear(feature_dim, args.num_classes).to(args.device)
             
-            # args.model = torchvision.models.resnet18(pretrained=True).to(args.device)
-            # feature_dim = list(args.model.fc.parameters())[0].shape[1]
-            # args.model.fc = nn.Linear(feature_dim, args.num_classes).to(args.device)
-            
+            # args.model = torchvision.models.resnet18(pretrained=False, num_classes=args.num_classes).to(args.device)
             # args.model = resnet18(num_classes=args.num_classes, has_bn=True, bn_block_num=4).to(args.device)
         
         elif model_str == "ResNet10":
@@ -201,6 +200,28 @@ def run(args):
             elif args.dataset == 'PAMAP2':
                 args.model = HARCNN(9, dim_hidden=3712, num_classes=args.num_classes, conv_kernel_size=(1, 9), 
                                     pool_kernel_size=(1, 2)).to(args.device)
+
+        elif model_str == "MaxViT":
+            # Load MaxViT-Tiny model via timm
+            try:
+                import timm
+            except Exception:
+                raise ImportError("Please install timm and huggingface-hub: pip install timm huggingface-hub")
+
+            model_name = 'maxvit_tiny_rw_224'
+            model = timm.create_model(model_name, pretrained=True)
+
+            # Get feature dimension from forward_features
+            with torch.no_grad():
+                dummy_input = torch.randn(1, 3, 224, 224)
+                features = model.forward_features(dummy_input)
+                nf = features.numel() // features.shape[0]  # total features per sample
+
+            # Replace classifier head
+            model.head = nn.Identity()  # Make base return features
+            model.fc = nn.Linear(nf, args.num_classes)
+
+            args.model = model.to(args.device)
 
         else:
             raise NotImplementedError

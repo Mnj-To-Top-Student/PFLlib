@@ -57,7 +57,9 @@ from flcore.trainmodel.resnet import *
 from flcore.trainmodel.alexnet import *
 from flcore.trainmodel.mobilenet_v2 import *
 from flcore.trainmodel.transformer import *
-
+from efficientnet_b0_kernel import EfficientNetB0KernelFedBABU
+from quanv_efficientnet_b0 import QuanvEfficientNetB0, QuanvEfficientNetB0Improved, QuanvEfficientNetB0Advanced
+from quanv_tinyvit import QuanvTinyViT, QuanvTinyViTImproved, QuanvTinyViTAdvanced
 from utils.result_utils import average_data
 from utils.mem_utils import MemReporter
 
@@ -79,6 +81,15 @@ def run(args):
         print("Creating server and clients ...")
         start = time.time()
 
+        
+        if "_quanv" in args.dataset:
+            if model_str == "EfficientNetB0":
+                print(f"⚠️  Auto-switching from EfficientNetB0 to QuanvEfficientNetB0 for {args.dataset} dataset")
+                model_str = "QuanvEfficientNetB0"
+            elif model_str == "TinyViT":
+                print(f"⚠️  Auto-switching from TinyViT to QuanvTinyViT for {args.dataset} dataset")
+                model_str = "QuanvTinyViT"
+        
         # Generate args.model
         if model_str == "MLR": # convex
             if "MNIST" in args.dataset:
@@ -109,6 +120,21 @@ def run(args):
             else:
                 args.model = DNN(60, 20, num_classes=args.num_classes).to(args.device)
         
+        
+        elif model_str == "QuanvEfficientNetB0":
+            args.model = QuanvEfficientNetB0Improved(
+                num_classes=args.num_classes, 
+                pretrained=True, 
+                improvement_level='standard'  # Use the improved version with better performance
+                ).to(args.device)
+
+        elif model_str == "QuanvTinyViT":
+            args.model = QuanvTinyViTImproved(
+                num_classes=args.num_classes,
+                pretrained=True,
+                improvement_level='standard'  # Use the improved version with better performance
+            ).to(args.device)
+            
         elif model_str == "ResNet18":
             args.model = torchvision.models.resnet18(pretrained=True).to(args.device)
             feature_dim = list(args.model.fc.parameters())[0].shape[1]
@@ -145,6 +171,27 @@ def run(args):
             # feature_dim = list(args.model.fc.parameters())[0].shape[1]
             # args.model.fc = nn.Linear(feature_dim, args.num_classes).to(args.device)
         
+        elif model_str == "EfficientNetB0":
+            model = torchvision.models.efficientnet_b0(pretrained=True)
+
+            in_features = model.classifier[1].in_features
+
+            # Replace classifier with identity
+            model.classifier[1] = nn.Identity()
+
+            # Create fc manually (so framework works)
+            model.fc = nn.Linear(in_features, args.num_classes)
+
+            args.model = model.to(args.device)
+
+        elif model_str == "EfficientNetB0Kernel":
+            args.model = EfficientNetB0KernelFedBABU(
+                num_classes=args.num_classes,
+                pretrained=True,
+                projection_dim=args.projection_dim,
+                embedding_dim=args.embedding_dim,
+            ).to(args.device)
+
         elif model_str == "TinyViT":
             # Load the Tiny-ViT model hosted on Hugging Face via timm
             try:
@@ -227,6 +274,9 @@ def run(args):
             raise NotImplementedError
 
         print(args.model)
+        
+        # Store model name string for result file naming
+        args.model_name = model_str
 
         # Optionally freeze backbone weights and train only the classification head
         if getattr(args, 'freeze_backbone', False):
@@ -326,9 +376,15 @@ def run(args):
             server = MOON(args, i)
 
         elif args.algorithm == "FedBABU":
-            args.head = copy.deepcopy(args.model.fc)
-            args.model.fc = nn.Identity()
-            args.model = BaseHeadSplit(args.model, args.head)
+            # Skip BaseHeadSplit wrapping for models that already have internal base/head split
+            if model_str not in ["QuanvTinyViT", "QuanvEfficientNetB0", "EfficientNetB0Kernel"]:
+                args.head = copy.deepcopy(args.model.fc)
+                args.model.fc = nn.Identity()
+                args.model = BaseHeadSplit(args.model, args.head)
+            else:
+                # Models with built-in base/head split (VQCHybrid, Hybrid, QuanvTinyViT, QuanvEfficientNetB0, InceptionV3)
+                # Store head for reference but don't wrap the model
+                args.head = args.model.head
             server = FedBABU(args, i)
 
         elif args.algorithm == "APPLE":
@@ -443,7 +499,8 @@ def run(args):
     
 
     # Global average
-    average_data(dataset=args.dataset, algorithm=args.algorithm, goal=args.goal, times=args.times)
+    model_name = getattr(args, 'model_name', '')
+    average_data(dataset=args.dataset, algorithm=args.algorithm, goal=args.goal, times=args.times, model=model_name, prev=args.prev)
 
     print("All done!")
 
@@ -554,6 +611,24 @@ if __name__ == "__main__":
     # freeze pretrained backbone and train only the head
     parser.add_argument('-fb', "--freeze_backbone", type=bool, default=False,
                         help="Freeze pretrained backbone weights and train only the head")
+    # kernel head options (Option 1: EfficientNetB0 + FedBABU + kernel classifier)
+    parser.add_argument('--projection_dim', type=int, default=128,
+                        help='Projection dimension before compact embedding layer.')
+    parser.add_argument('--embedding_dim', type=int, default=8,
+                        help='Compact embedding dimension used by classical/quantum kernel heads.')
+    parser.add_argument('--use_kernel_classifier', type=bool, default=False,
+                        help='Enable post-training local kernel classifier on frozen embeddings.')
+    parser.add_argument('--kernel_classifier_type', type=str, default='quantum_kernel_svm',
+                        choices=['svm_rbf', 'quantum_kernel_svm'],
+                        help='Type of local kernel classifier when use_kernel_classifier=True.')
+    parser.add_argument('--kernel_max_train_samples', type=int, default=600,
+                        help='Cap per-client samples used to fit kernel classifier to control O(N^2) cost.')
+    parser.add_argument('--kernel_gamma', type=float, default=0.5,
+                        help='Gamma for classical RBF SVM kernel.')
+    parser.add_argument('--kernel_q_layers', type=int, default=2,
+                        help='Number of entangling layers in quantum feature map kernel.')
+    parser.add_argument('--kernel_q_shots', type=int, default=0,
+                        help='Shots for quantum kernel backend; 0 means analytic simulator.')
     # FedGen
     parser.add_argument('-nd', "--noise_dim", type=int, default=512)
     parser.add_argument('-glr', "--generator_learning_rate", type=float, default=0.005)
